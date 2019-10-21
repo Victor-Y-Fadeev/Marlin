@@ -1,9 +1,9 @@
 /**
  * Marlin 3D Printer Firmware
- * Copyright (C) 2016 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
+ * Copyright (c) 2019 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
  *
  * Based on Sprinter and grbl.
- * Copyright (C) 2011 Camiel Gubbels / Erik van der Zalm
+ * Copyright (c) 2011 Camiel Gubbels / Erik van der Zalm
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,9 +19,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
+#pragma once
 
-#ifndef MARLINSERIAL_H
-#define MARLINSERIAL_H
 #include <HardwareSerial.h>
 #include <WString.h>
 
@@ -33,7 +32,6 @@
 #ifndef SERIAL_PORT
   #define SERIAL_PORT 0
 #endif
-
 #ifndef RX_BUFFER_SIZE
   #define RX_BUFFER_SIZE 128
 #endif
@@ -51,14 +49,14 @@ public:
     {
     }
 
+  void end() {}
+
   #if ENABLED(EMERGENCY_PARSER)
     bool recv_callback(const char c) override {
       emergency_parser.update(emergency_state, c);
       return true; // do not discard character
     }
-  #endif
 
-  #if ENABLED(EMERGENCY_PARSER)
     EmergencyParser::State emergency_state;
   #endif
 };
@@ -67,5 +65,3 @@ extern MarlinSerial MSerial;
 extern MarlinSerial MSerial1;
 extern MarlinSerial MSerial2;
 extern MarlinSerial MSerial3;
-
-#endif // MARLINSERIAL_H

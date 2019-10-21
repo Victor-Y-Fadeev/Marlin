@@ -1,9 +1,9 @@
 /**
  * Marlin 3D Printer Firmware
- * Copyright (C) 2016 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
+ * Copyright (c) 2019 MarlinFirmware [https://github.com/MarlinFirmware/Marlin]
  *
  * Based on Sprinter and grbl.
- * Copyright (C) 2011 Camiel Gubbels / Erik van der Zalm
+ * Copyright (c) 2011 Camiel Gubbels / Erik van der Zalm
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,132 +22,269 @@
 
 #include "../inc/MarlinConfigPre.h"
 
-#if ENABLED(ULTRA_LCD)
+#ifdef LED_BACKLIGHT_TIMEOUT
+  #include "../feature/leds/leds.h"
+#endif
 
-#include <stdarg.h>
+// All displays share the MarlinUI class
+#if HAS_DISPLAY
+  #include "../gcode/queue.h"
+  #include "ultralcd.h"
+  #include "fontutils.h"
+  MarlinUI ui;
+  #include "../sd/cardreader.h"
+  #if ENABLED(EXTENSIBLE_UI)
+    #define START_OF_UTF8_CHAR(C) (((C) & 0xC0u) != 0x80u)
+  #endif
+  #if ENABLED(HOST_ACTION_COMMANDS)
+    #include "../feature/host_actions.h"
+  #endif
+#endif
 
-#include "ultralcd.h"
+#if HAS_SPI_LCD
+  #if ENABLED(STATUS_MESSAGE_SCROLLING)
+    uint8_t MarlinUI::status_scroll_offset; // = 0
+    constexpr uint8_t MAX_MESSAGE_LENGTH = _MAX(LONG_FILENAME_LENGTH, MAX_LANG_CHARSIZE * 2 * (LCD_WIDTH));
+  #else
+    constexpr uint8_t MAX_MESSAGE_LENGTH = MAX_LANG_CHARSIZE * (LCD_WIDTH);
+  #endif
+#elif ENABLED(EXTENSIBLE_UI)
+  constexpr uint8_t MAX_MESSAGE_LENGTH = 63;
+#endif
+
+#if HAS_SPI_LCD || ENABLED(EXTENSIBLE_UI)
+  uint8_t MarlinUI::alert_level; // = 0
+  char MarlinUI::status_message[MAX_MESSAGE_LENGTH + 1];
+#endif
+
+#if ENABLED(LCD_SET_PROGRESS_MANUALLY)
+  MarlinUI::progress_t MarlinUI::progress_override; // = 0
+#endif
+
+#if HAS_BUZZER
+  #include "../libs/buzzer.h"
+  #if ENABLED(PCA9632_BUZZER)
+    #include "../feature/leds/pca9632.h"
+  #endif
+  void MarlinUI::buzz(const long duration, const uint16_t freq) {
+    #if ENABLED(LCD_USE_I2C_BUZZER)
+      lcd.buzz(duration, freq);
+    #elif ENABLED(PCA9632_BUZZER)
+      pca9632_buzz(duration, freq);
+    #elif USE_BEEPER
+      buzzer.tone(duration, freq);
+    #endif
+  }
+#endif
+
+#if HAS_SPI_LCD
+
+#if HAS_GRAPHICAL_LCD
+  #include "dogm/ultralcd_DOGM.h"
+#endif
+
 #include "lcdprint.h"
 
 #include "../sd/cardreader.h"
 #include "../module/temperature.h"
 #include "../module/planner.h"
-#include "../module/stepper.h"
-#include "../module/motion.h"
-#include "../module/probe.h"
 #include "../module/printcounter.h"
-#include "../gcode/gcode.h"
-#include "../gcode/queue.h"
-#include "../module/configuration_store.h"
-#include "../module/tool_change.h"
+#include "../module/motion.h"
 
 #include "../Marlin.h"
 
-#if ENABLED(ADVANCED_PAUSE_FEATURE)
-  #include "../feature/pause.h"
-#endif
-
 #if ENABLED(POWER_LOSS_RECOVERY)
   #include "../feature/power_loss_recovery.h"
-  #if ENABLED(ULTIPANEL)
-    void menu_job_recovery();
-  #endif
 #endif
 
-#if ENABLED(PRINTCOUNTER) && ENABLED(LCD_INFO_MENU)
-  #include "../libs/duration_t.h"
-#endif
-
-#if ENABLED(FILAMENT_LCD_DISPLAY)
-  #include "../feature/filwidth.h"
-#endif
-
-#if ENABLED(BLTOUCH)
-  #include "../module/endstops.h"
-#endif
-
-#if HAS_LEVELING
+#if ENABLED(AUTO_BED_LEVELING_UBL)
   #include "../feature/bedlevel/bedlevel.h"
 #endif
 
-#if DISABLED(LCD_USE_I2C_BUZZER)
-  #include "../libs/buzzer.h"
+#if HAS_TRINAMIC
+  #include "../feature/tmc_util.h"
 #endif
 
-// Buttons
-volatile uint8_t buttons;
+#if HAS_ENCODER_ACTION
+  volatile uint8_t MarlinUI::buttons;
+  #if HAS_SLOW_BUTTONS
+    volatile uint8_t MarlinUI::slow_buttons;
+  #endif
+  #if ENABLED(TOUCH_BUTTONS)
+    #include "../feature/touch/xpt2046.h"
+  #endif
+#endif
 
-#if ENABLED(SDSUPPORT) && PIN_EXISTS(SD_DETECT)
+#if ENABLED(INIT_SDCARD_ON_BOOT)
   uint8_t lcd_sd_status;
 #endif
 
-#if ENABLED(STATUS_MESSAGE_SCROLLING)
-  uint8_t status_scroll_offset = 0;
-  #if LONG_FILENAME_LENGTH > CHARSIZE * 2 * (LCD_WIDTH)
-    #define MAX_MESSAGE_LENGTH LONG_FILENAME_LENGTH
-  #else
-    #define MAX_MESSAGE_LENGTH CHARSIZE * 2 * (LCD_WIDTH)
-  #endif
-#else
-  #define MAX_MESSAGE_LENGTH CHARSIZE * (LCD_WIDTH)
+#if HAS_LCD_MENU && LCD_TIMEOUT_TO_STATUS
+  bool MarlinUI::defer_return_to_status;
 #endif
 
-char lcd_status_message[MAX_MESSAGE_LENGTH + 1];
-uint8_t lcd_status_update_delay = 1, // First update one loop delayed
-        lcd_status_message_level;    // Higher level blocks lower level
+uint8_t MarlinUI::lcd_status_update_delay = 1; // First update one loop delayed
 
-#if ENABLED(FILAMENT_LCD_DISPLAY) && ENABLED(SDSUPPORT)
-  millis_t previous_lcd_status_ms = 0;
+#if BOTH(FILAMENT_LCD_DISPLAY, SDSUPPORT)
+  millis_t MarlinUI::next_filament_display; // = 0
 #endif
 
-#if ENABLED(SDSUPPORT) && ENABLED(ULTIPANEL) && ENABLED(SCROLL_LONG_FILENAMES)
-  uint8_t filename_scroll_pos, filename_scroll_max;
-#endif
-
-#if ENABLED(LCD_SET_PROGRESS_MANUALLY)
-  uint8_t progress_bar_percent;
-#endif
-
-millis_t next_button_update_ms;
+millis_t MarlinUI::next_button_update_ms; // = 0
 
 #if HAS_GRAPHICAL_LCD
-  bool drawing_screen, first_page; // = false
+  bool MarlinUI::drawing_screen, MarlinUI::first_page; // = false
 #endif
 
-#if ENABLED(ENCODER_RATE_MULTIPLIER)
-  bool encoderRateMultiplierEnabled;
+// Encoder Handling
+#if HAS_ENCODER_ACTION
+  uint16_t MarlinUI::encoderPosition;
+  volatile int8_t encoderDiff; // Updated in update_buttons, added to encoderPosition every LCD update
 #endif
-
-#if ENABLED(REVERSE_MENU_DIRECTION)
-  int8_t encoderDirection = 1;
-#endif
-
-void lcd_status_screen();
 
 #if HAS_LCD_MENU
   #include "menu/menu.h"
+  #include "../sd/cardreader.h"
 
-  screenFunc_t currentScreen = lcd_status_screen;
+  #if ENABLED(SDSUPPORT)
 
-  // Encoder Handling
-  volatile int8_t encoderDiff; // Updated in lcd_buttons_update, added to encoderPosition every LCD update
-  uint32_t encoderPosition;
-  millis_t lastEncoderMovementMillis = 0;
-  bool lcd_clicked, wait_for_unclick;
+    #if ENABLED(SCROLL_LONG_FILENAMES)
+      uint8_t MarlinUI::filename_scroll_pos, MarlinUI::filename_scroll_max;
+    #endif
+
+    const char * MarlinUI::scrolled_filename(CardReader &theCard, const uint8_t maxlen, uint8_t hash, const bool doScroll) {
+      const char *outstr = theCard.longest_filename();
+      if (theCard.longFilename[0]) {
+        #if ENABLED(SCROLL_LONG_FILENAMES)
+          if (doScroll) {
+            for (uint8_t l = FILENAME_LENGTH; l--;)
+              hash = ((hash << 1) | (hash >> 7)) ^ theCard.filename[l];      // rotate, xor
+            static uint8_t filename_scroll_hash;
+            if (filename_scroll_hash != hash) {                              // If the hash changed...
+              filename_scroll_hash = hash;                                   // Save the new hash
+              filename_scroll_max = _MAX(0, utf8_strlen(theCard.longFilename) - maxlen); // Update the scroll limit
+              filename_scroll_pos = 0;                                       // Reset scroll to the start
+              lcd_status_update_delay = 8;                                   // Don't scroll right away
+            }
+            outstr += filename_scroll_pos;
+          }
+        #else
+          theCard.longFilename[maxlen] = '\0'; // cutoff at screen edge
+        #endif
+      }
+      return outstr;
+    }
+
+  #endif
+
+  screenFunc_t MarlinUI::currentScreen; // Initialized in CTOR
+
+  #if ENABLED(ENCODER_RATE_MULTIPLIER)
+    bool MarlinUI::encoderRateMultiplierEnabled;
+    millis_t MarlinUI::lastEncoderMovementMillis = 0;
+    void MarlinUI::enable_encoder_multiplier(const bool onoff) {
+      encoderRateMultiplierEnabled = onoff;
+      lastEncoderMovementMillis = 0;
+    }
+  #endif
+
+  #if EITHER(REVERSE_MENU_DIRECTION, REVERSE_SELECT_DIRECTION)
+    int8_t MarlinUI::encoderDirection = ENCODERBASE;
+  #endif
+
+  #if ENABLED(TOUCH_BUTTONS)
+    uint8_t MarlinUI::repeat_delay;
+  #endif
+
+  bool MarlinUI::lcd_clicked;
   float move_menu_scale;
 
-  bool use_click() {
+  bool MarlinUI::use_click() {
     const bool click = lcd_clicked;
     lcd_clicked = false;
     return click;
   }
-#endif
 
-void lcd_init() {
+  #if EITHER(AUTO_BED_LEVELING_UBL, G26_MESH_VALIDATION)
 
-  lcd_implementation_init();
+    bool MarlinUI::external_control; // = false
 
-  #if ENABLED(NEWPANEL)
+    void MarlinUI::wait_for_release() {
+      while (button_pressed()) safe_delay(50);
+      safe_delay(50);
+    }
+
+  #endif
+
+  void _wrap_string(uint8_t &col, uint8_t &row, const char * const string, read_byte_cb_t cb_read_byte, bool wordwrap/*=false*/) {
+    SETCURSOR(col, row);
+    if (!string) return;
+
+    auto _newline = [&col, &row]() {
+      col = 0; row++;                 // Move col to string len (plus space)
+      SETCURSOR(0, row);              // Simulate carriage return
+    };
+
+    uint8_t *p = (uint8_t*)string;
+    wchar_t ch;
+    if (wordwrap) {
+      uint8_t *wrd = nullptr, c = 0;
+      // find the end of the part
+      for (;;) {
+        if (!wrd) wrd = p;            // Get word start /before/ advancing
+        p = get_utf8_value_cb(p, cb_read_byte, &ch);
+        const bool eol = !ch;         // zero ends the string
+        // End or a break between phrases?
+        if (eol || ch == ' ' || ch == '-' || ch == '+' || ch == '.') {
+          if (!c && ch == ' ') { if (wrd) wrd++; continue; } // collapse extra spaces
+          // Past the right and the word is not too long?
+          if (col + c > LCD_WIDTH && col >= (LCD_WIDTH) / 4) _newline(); // should it wrap?
+          c += !eol;                  // +1 so the space will be printed
+          col += c;                   // advance col to new position
+          while (c) {                 // character countdown
+            --c;                      // count down to zero
+            wrd = get_utf8_value_cb(wrd, cb_read_byte, &ch); // get characters again
+            lcd_put_wchar(ch);        // character to the LCD
+          }
+          if (eol) break;             // all done!
+          wrd = nullptr;              // set up for next word
+        }
+        else c++;                     // count word characters
+      }
+    }
+    else {
+      for (;;) {
+        p = get_utf8_value_cb(p, cb_read_byte, &ch);
+        if (!ch) break;
+        lcd_put_wchar(ch);
+        col++;
+        if (col >= LCD_WIDTH) _newline();
+      }
+    }
+  }
+
+  void MarlinUI::draw_select_screen_prompt(PGM_P const pref, const char * const string/*=nullptr*/, PGM_P const suff/*=nullptr*/) {
+    const uint8_t plen = utf8_strlen_P(pref), slen = suff ? utf8_strlen_P(suff) : 0;
+    uint8_t col = 0, row = 0;
+    if (!string && plen + slen <= LCD_WIDTH) {
+      col = (LCD_WIDTH - plen - slen) / 2;
+      row = LCD_HEIGHT > 3 ? 1 : 0;
+    }
+    wrap_string_P(col, row, pref, true);
+    if (string) {
+      if (col) { col = 0; row++; } // Move to the start of the next line
+      wrap_string(col, row, string);
+    }
+    if (suff) wrap_string_P(col, row, suff);
+  }
+
+#endif // HAS_LCD_MENU
+
+void MarlinUI::init() {
+
+  init_lcd();
+
+  #if HAS_DIGITAL_BUTTONS
+
     #if BUTTON_EXISTS(EN1)
       SET_INPUT_PULLUP(BTN_EN1);
     #endif
@@ -156,12 +293,6 @@ void lcd_init() {
     #endif
     #if BUTTON_EXISTS(ENC)
       SET_INPUT_PULLUP(BTN_ENC);
-    #endif
-
-    #if ENABLED(REPRAPWORLD_KEYPAD) && DISABLED(ADC_KEYPAD)
-      SET_OUTPUT(SHIFT_CLK);
-      OUT_WRITE(SHIFT_LD, HIGH);
-      SET_INPUT_PULLUP(SHIFT_OUT);
     #endif
 
     #if BUTTON_EXISTS(UP)
@@ -177,37 +308,51 @@ void lcd_init() {
       SET_INPUT(BTN_RT);
     #endif
 
-  #else // !NEWPANEL
+  #endif // !HAS_DIGITAL_BUTTONS
+
+  #if HAS_SHIFT_ENCODER
 
     #if ENABLED(SR_LCD_2W_NL) // Non latching 2 wire shift register
+
       SET_OUTPUT(SR_DATA_PIN);
       SET_OUTPUT(SR_CLK_PIN);
+
     #elif defined(SHIFT_CLK)
+
       SET_OUTPUT(SHIFT_CLK);
       OUT_WRITE(SHIFT_LD, HIGH);
-      OUT_WRITE(SHIFT_EN, LOW);
+      #if defined(SHIFT_EN) && SHIFT_EN >= 0
+        OUT_WRITE(SHIFT_EN, LOW);
+      #endif
       SET_INPUT_PULLUP(SHIFT_OUT);
-    #endif // SR_LCD_2W_NL
 
-  #endif // !NEWPANEL
+    #endif
 
-  #if ENABLED(SDSUPPORT) && PIN_EXISTS(SD_DETECT)
-    SET_INPUT_PULLUP(SD_DETECT_PIN);
-    lcd_sd_status = 2; // UNKNOWN
+  #endif // HAS_SHIFT_ENCODER
+
+  #if ENABLED(SDSUPPORT)
+    #if PIN_EXISTS(SD_DETECT)
+      SET_INPUT_PULLUP(SD_DETECT_PIN);
+    #endif
+    #if ENABLED(INIT_SDCARD_ON_BOOT)
+      lcd_sd_status = 2; // UNKNOWN
+    #endif
   #endif
 
-  #if ENABLED(LCD_HAS_SLOW_BUTTONS)
-    slow_buttons = 0;
+  #if HAS_ENCODER_ACTION
+    #if HAS_SLOW_BUTTONS
+      slow_buttons = 0;
+    #endif
   #endif
 
-  lcd_buttons_update();
+  update_buttons();
 
-  #if ENABLED(ULTIPANEL)
+  #if HAS_ENCODER_ACTION
     encoderDiff = 0;
   #endif
 }
 
-bool lcd_blink() {
+bool MarlinUI::get_blink() {
   static uint8_t blink = 0;
   static millis_t next_blink_ms = 0;
   millis_t ms = millis();
@@ -222,137 +367,106 @@ bool lcd_blink() {
 ///////////// Keypad Handling //////////////
 ////////////////////////////////////////////
 
-#if ENABLED(REPRAPWORLD_KEYPAD)
-  volatile uint8_t buttons_reprapworld_keypad;
-#endif
+#if ENABLED(REPRAPWORLD_KEYPAD) && HAS_ENCODER_ACTION
 
-#if ENABLED(ADC_KEYPAD)
+  volatile uint8_t MarlinUI::keypad_buttons;
 
-  #define KEYPAD_HOME EN_REPRAPWORLD_KEYPAD_F1
-  #define KEYPAD_EN_C EN_REPRAPWORLD_KEYPAD_MIDDLE
+  #if HAS_LCD_MENU && !HAS_ADC_BUTTONS
 
-  inline bool handle_adc_keypad() {
-    #define ADC_MIN_KEY_DELAY 100
-    if (buttons_reprapworld_keypad) {
-      lcdDrawUpdate = LCDVIEW_REDRAW_NOW;
-      if (encoderDirection == -1) { // side effect which signals we are inside a menu
-        if      (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_DOWN)  encoderPosition -= ENCODER_STEPS_PER_MENU_ITEM;
-        else if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_UP)    encoderPosition += ENCODER_STEPS_PER_MENU_ITEM;
-        else if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_LEFT)  { menu_action_back(); lcd_quick_feedback(true); }
-        else if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_RIGHT) { lcd_return_to_status(); lcd_quick_feedback(true); }
+    void lcd_move_x();
+    void lcd_move_y();
+    void lcd_move_z();
+
+    void _reprapworld_keypad_move(const AxisEnum axis, const int16_t dir) {
+      move_menu_scale = REPRAPWORLD_KEYPAD_MOVE_STEP;
+      encoderPosition = dir;
+      switch (axis) {
+        case X_AXIS: lcd_move_x(); break;
+        case Y_AXIS: lcd_move_y(); break;
+        case Z_AXIS: lcd_move_z();
+        default: break;
       }
-      else {
-        if (buttons_reprapworld_keypad & (EN_REPRAPWORLD_KEYPAD_DOWN|EN_REPRAPWORLD_KEYPAD_UP|EN_REPRAPWORLD_KEYPAD_RIGHT)) {
-               if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_DOWN)  encoderPosition += ENCODER_PULSES_PER_STEP;
-          else if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_UP)    encoderPosition -= ENCODER_PULSES_PER_STEP;
-          else if (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_RIGHT) encoderPosition = 0;
-        }
-      }
-      #if ENABLED(ADC_KEYPAD_DEBUG)
-        SERIAL_PROTOCOLLNPAIR("buttons_reprapworld_keypad = ", (uint32_t)buttons_reprapworld_keypad);
-        SERIAL_PROTOCOLLNPAIR("encoderPosition = ", (uint32_t)encoderPosition);
-      #endif
-      next_button_update_ms = millis() + ADC_MIN_KEY_DELAY;
-      return true;
     }
+
+  #endif
+
+  bool MarlinUI::handle_keypad() {
+
+    #if HAS_ADC_BUTTONS
+
+      #define ADC_MIN_KEY_DELAY 100
+      if (keypad_buttons) {
+        #if HAS_ENCODER_ACTION
+          refresh(LCDVIEW_REDRAW_NOW);
+          #if HAS_LCD_MENU
+            if (encoderDirection == -(ENCODERBASE)) { // ADC_KEYPAD forces REVERSE_MENU_DIRECTION, so this indicates menu navigation
+                   if (RRK(EN_KEYPAD_UP))     encoderPosition += ENCODER_STEPS_PER_MENU_ITEM;
+              else if (RRK(EN_KEYPAD_DOWN))   encoderPosition -= ENCODER_STEPS_PER_MENU_ITEM;
+              else if (RRK(EN_KEYPAD_LEFT))   { MenuItem_back::action(); quick_feedback(); }
+              else if (RRK(EN_KEYPAD_RIGHT))  { return_to_status(); quick_feedback(); }
+            }
+            else
+          #endif
+          {
+            #if HAS_LCD_MENU
+                   if (RRK(EN_KEYPAD_UP))     encoderPosition -= ENCODER_PULSES_PER_STEP;
+              else if (RRK(EN_KEYPAD_DOWN))   encoderPosition += ENCODER_PULSES_PER_STEP;
+              else if (RRK(EN_KEYPAD_LEFT))   { MenuItem_back::action(); quick_feedback(); }
+              else if (RRK(EN_KEYPAD_RIGHT))  encoderPosition = 0;
+            #else
+                   if (RRK(EN_KEYPAD_UP)   || RRK(EN_KEYPAD_LEFT))  encoderPosition -= ENCODER_PULSES_PER_STEP;
+              else if (RRK(EN_KEYPAD_DOWN) || RRK(EN_KEYPAD_RIGHT)) encoderPosition += ENCODER_PULSES_PER_STEP;
+            #endif
+          }
+        #endif
+        next_button_update_ms = millis() + ADC_MIN_KEY_DELAY;
+        return true;
+      }
+
+    #else // !HAS_ADC_BUTTONS
+
+      static uint8_t keypad_debounce = 0;
+
+      if (!RRK( EN_KEYPAD_F1    | EN_KEYPAD_F2
+              | EN_KEYPAD_F3    | EN_KEYPAD_DOWN
+              | EN_KEYPAD_RIGHT | EN_KEYPAD_MIDDLE
+              | EN_KEYPAD_UP    | EN_KEYPAD_LEFT )
+      ) {
+        if (keypad_debounce > 0) keypad_debounce--;
+      }
+      else if (!keypad_debounce) {
+        keypad_debounce = 2;
+
+        const bool homed = all_axes_homed();
+
+        #if HAS_LCD_MENU
+
+          if (RRK(EN_KEYPAD_MIDDLE))  goto_screen(menu_move);
+
+          #if DISABLED(DELTA) && Z_HOME_DIR < 0
+            if (RRK(EN_KEYPAD_F2))    _reprapworld_keypad_move(Z_AXIS,  1);
+          #endif
+
+          if (homed) {
+            #if ENABLED(DELTA) || Z_HOME_DIR != -1
+              if (RRK(EN_KEYPAD_F2))  _reprapworld_keypad_move(Z_AXIS,  1);
+            #endif
+            if (RRK(EN_KEYPAD_F3))    _reprapworld_keypad_move(Z_AXIS, -1);
+            if (RRK(EN_KEYPAD_LEFT))  _reprapworld_keypad_move(X_AXIS, -1);
+            if (RRK(EN_KEYPAD_RIGHT)) _reprapworld_keypad_move(X_AXIS,  1);
+            if (RRK(EN_KEYPAD_DOWN))  _reprapworld_keypad_move(Y_AXIS,  1);
+            if (RRK(EN_KEYPAD_UP))    _reprapworld_keypad_move(Y_AXIS, -1);
+          }
+
+        #endif // HAS_LCD_MENU
+
+        if (!homed && RRK(EN_KEYPAD_F1)) queue.inject_P(PSTR("G28"));
+        return true;
+      }
+
+    #endif // !ADC_KEYPAD
 
     return false;
-  }
-
-#elif ENABLED(REPRAPWORLD_KEYPAD)
-
-  #define REPRAPWORLD_BTN_OFFSET 0 // bit offset into buttons for shift register values
-
-  #define BLEN_REPRAPWORLD_KEYPAD_F3     0
-  #define BLEN_REPRAPWORLD_KEYPAD_F2     1
-  #define BLEN_REPRAPWORLD_KEYPAD_F1     2
-  #define BLEN_REPRAPWORLD_KEYPAD_DOWN   3
-  #define BLEN_REPRAPWORLD_KEYPAD_RIGHT  4
-  #define BLEN_REPRAPWORLD_KEYPAD_MIDDLE 5
-  #define BLEN_REPRAPWORLD_KEYPAD_UP     6
-  #define BLEN_REPRAPWORLD_KEYPAD_LEFT   7
-
-  #define EN_REPRAPWORLD_KEYPAD_F3      (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_F3))
-  #define EN_REPRAPWORLD_KEYPAD_F2      (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_F2))
-  #define EN_REPRAPWORLD_KEYPAD_F1      (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_F1))
-  #define EN_REPRAPWORLD_KEYPAD_DOWN    (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_DOWN))
-  #define EN_REPRAPWORLD_KEYPAD_RIGHT   (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_RIGHT))
-  #define EN_REPRAPWORLD_KEYPAD_MIDDLE  (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_MIDDLE))
-  #define EN_REPRAPWORLD_KEYPAD_UP      (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_UP))
-  #define EN_REPRAPWORLD_KEYPAD_LEFT    (_BV(REPRAPWORLD_BTN_OFFSET + BLEN_REPRAPWORLD_KEYPAD_LEFT))
-
-  #define REPRAPWORLD_KEYPAD_MOVE_Z_DOWN  (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_F3)
-  #define REPRAPWORLD_KEYPAD_MOVE_Z_UP    (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_F2)
-  #define REPRAPWORLD_KEYPAD_MOVE_Y_DOWN  (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_DOWN)
-  #define REPRAPWORLD_KEYPAD_MOVE_X_RIGHT (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_RIGHT)
-  #define REPRAPWORLD_KEYPAD_MOVE_Y_UP    (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_UP)
-  #define REPRAPWORLD_KEYPAD_MOVE_X_LEFT  (buttons_reprapworld_keypad & EN_REPRAPWORLD_KEYPAD_LEFT)
-
-  #define KEYPAD_HOME EN_REPRAPWORLD_KEYPAD_MIDDLE
-  #define KEYPAD_EN_C EN_REPRAPWORLD_KEYPAD_F1
-  #define REPRAPWORLD_KEYPAD_MOVE_HOME    (buttons_reprapworld_keypad & KEYPAD_HOME)
-  #define REPRAPWORLD_KEYPAD_MOVE_MENU    (buttons_reprapworld_keypad & KEYPAD_EN_C)
-
-  #define REPRAPWORLD_KEYPAD_PRESSED      (buttons_reprapworld_keypad & ( \
-                                            EN_REPRAPWORLD_KEYPAD_F3 | \
-                                            EN_REPRAPWORLD_KEYPAD_F2 | \
-                                            EN_REPRAPWORLD_KEYPAD_F1 | \
-                                            EN_REPRAPWORLD_KEYPAD_DOWN | \
-                                            EN_REPRAPWORLD_KEYPAD_RIGHT | \
-                                            EN_REPRAPWORLD_KEYPAD_MIDDLE | \
-                                            EN_REPRAPWORLD_KEYPAD_UP | \
-                                            EN_REPRAPWORLD_KEYPAD_LEFT) \
-                                          )
-
-  void _reprapworld_keypad_move(const AxisEnum axis, const int16_t dir) {
-    move_menu_scale = REPRAPWORLD_KEYPAD_MOVE_STEP;
-    encoderPosition = dir;
-    switch (axis) {
-      case X_AXIS: lcd_move_x(); break;
-      case Y_AXIS: lcd_move_y(); break;
-      case Z_AXIS: lcd_move_z();
-      default: break;
-    }
-  }
-  inline void reprapworld_keypad_move_z_up()    { _reprapworld_keypad_move(Z_AXIS,  1); }
-  inline void reprapworld_keypad_move_z_down()  { _reprapworld_keypad_move(Z_AXIS, -1); }
-  inline void reprapworld_keypad_move_x_left()  { _reprapworld_keypad_move(X_AXIS, -1); }
-  inline void reprapworld_keypad_move_x_right() { _reprapworld_keypad_move(X_AXIS,  1); }
-  inline void reprapworld_keypad_move_y_up()    { _reprapworld_keypad_move(Y_AXIS, -1); }
-  inline void reprapworld_keypad_move_y_down()  { _reprapworld_keypad_move(Y_AXIS,  1); }
-  inline void reprapworld_keypad_move_home()    { enqueue_and_echo_commands_P(PSTR("G28")); } // move all axes home and wait
-  inline void reprapworld_keypad_move_menu()    { lcd_goto_screen(menu_move); }
-
-  inline void handle_reprapworld_keypad() {
-
-    static uint8_t keypad_debounce = 0;
-
-    if (!REPRAPWORLD_KEYPAD_PRESSED) {
-      if (keypad_debounce > 0) keypad_debounce--;
-    }
-    else if (!keypad_debounce) {
-      keypad_debounce = 2;
-
-      if (REPRAPWORLD_KEYPAD_MOVE_MENU)       reprapworld_keypad_move_menu();
-
-      #if DISABLED(DELTA) && Z_HOME_DIR == -1
-        if (REPRAPWORLD_KEYPAD_MOVE_Z_UP)     reprapworld_keypad_move_z_up();
-      #endif
-
-      if (all_axes_homed()) {
-        #if ENABLED(DELTA) || Z_HOME_DIR != -1
-          if (REPRAPWORLD_KEYPAD_MOVE_Z_UP)   reprapworld_keypad_move_z_up();
-        #endif
-        if (REPRAPWORLD_KEYPAD_MOVE_Z_DOWN)   reprapworld_keypad_move_z_down();
-        if (REPRAPWORLD_KEYPAD_MOVE_X_LEFT)   reprapworld_keypad_move_x_left();
-        if (REPRAPWORLD_KEYPAD_MOVE_X_RIGHT)  reprapworld_keypad_move_x_right();
-        if (REPRAPWORLD_KEYPAD_MOVE_Y_DOWN)   reprapworld_keypad_move_y_down();
-        if (REPRAPWORLD_KEYPAD_MOVE_Y_UP)     reprapworld_keypad_move_y_up();
-      }
-      else {
-        if (REPRAPWORLD_KEYPAD_MOVE_HOME)     reprapworld_keypad_move_home();
-      }
-    }
   }
 
 #endif // REPRAPWORLD_KEYPAD
@@ -363,23 +477,17 @@ bool lcd_blink() {
  * This is very display-dependent, so the lcd implementation draws this.
  */
 
-#if LCD_INFO_SCREEN_STYLE == 0
-  void lcd_impl_status_screen_0();
-#elif LCD_INFO_SCREEN_STYLE == 1
-  void lcd_impl_status_screen_1();
+#if ENABLED(LCD_PROGRESS_BAR)
+  millis_t MarlinUI::progress_bar_ms; // = 0
+  #if PROGRESS_MSG_EXPIRE > 0
+    millis_t MarlinUI::expire_status_ms; // = 0
+  #endif
 #endif
 
-void lcd_status_screen() {
+void MarlinUI::status_screen() {
 
-  #if ENABLED(ULTIPANEL)
-    ENCODER_DIRECTION_NORMAL();
+  #if HAS_LCD_MENU
     ENCODER_RATE_MULTIPLY(false);
-  #endif
-
-  #if ENABLED(LCD_SET_PROGRESS_MANUALLY) && ENABLED(SDSUPPORT) && (ENABLED(LCD_PROGRESS_BAR) || ENABLED(DOGLCD))
-    // Progress bar % comes from SD when actively printing
-    if (IS_SD_PRINTING())
-      progress_bar_percent = card.percentDone();
   #endif
 
   #if ENABLED(LCD_PROGRESS_BAR)
@@ -390,7 +498,10 @@ void lcd_status_screen() {
     // share the same line on the display.
     //
 
-    millis_t ms = millis();
+    #if DISABLED(PROGRESS_MSG_ONCE) || (PROGRESS_MSG_EXPIRE > 0)
+      #define GOT_MS
+      const millis_t ms = millis();
+    #endif
 
     // If the message will blink rather than expire...
     #if DISABLED(PROGRESS_MSG_ONCE)
@@ -403,14 +514,10 @@ void lcd_status_screen() {
       // Handle message expire
       if (expire_status_ms > 0) {
 
-        #if DISABLED(LCD_SET_PROGRESS_MANUALLY)
-          const uint8_t progress_bar_percent = card.percentDone();
-        #endif
-
         // Expire the message if a job is active and the bar has ticks
-        if (progress_bar_percent > 2 && !print_job_timer.isPaused()) {
+        if (get_progress_percent() > 2 && !print_job_timer.isPaused()) {
           if (ELAPSED(ms, expire_status_ms)) {
-            lcd_status_message[0] = '\0';
+            status_message[0] = '\0';
             expire_status_ms = 0;
           }
         }
@@ -425,116 +532,110 @@ void lcd_status_screen() {
 
   #endif // LCD_PROGRESS_BAR
 
-  #if ENABLED(ULTIPANEL)
+  #if HAS_LCD_MENU
 
     if (use_click()) {
-      #if ENABLED(FILAMENT_LCD_DISPLAY) && ENABLED(SDSUPPORT)
-        previous_lcd_status_ms = millis();  // get status message to show up for a while
+      #if BOTH(FILAMENT_LCD_DISPLAY, SDSUPPORT)
+        next_filament_display = millis() + 5000UL;  // Show status message for 5s
       #endif
-      lcd_implementation_init( // to maybe revive the LCD if static electricity killed it.
-        #if ENABLED(LCD_PROGRESS_BAR)
-          CHARSET_MENU
-        #endif
-      );
-      lcd_goto_screen(menu_main);
+      goto_screen(menu_main);
+      #if DISABLED(NO_LCD_REINIT)
+        init_lcd(); // May revive the LCD if static electricity killed it
+      #endif
       return;
     }
 
-    #if ENABLED(ULTIPANEL_FEEDMULTIPLY)
-      const int16_t new_frm = feedrate_percentage + (int32_t)encoderPosition;
-      // Dead zone at 100% feedrate
-      if ((feedrate_percentage < 100 && new_frm > 100) || (feedrate_percentage > 100 && new_frm < 100)) {
-        feedrate_percentage = 100;
-        encoderPosition = 0;
-      }
-      else if (feedrate_percentage == 100) {
-        if ((int32_t)encoderPosition > ENCODER_FEEDRATE_DEADZONE) {
-          feedrate_percentage += (int32_t)encoderPosition - (ENCODER_FEEDRATE_DEADZONE);
-          encoderPosition = 0;
-        }
-        else if ((int32_t)encoderPosition < -(ENCODER_FEEDRATE_DEADZONE)) {
-          feedrate_percentage += (int32_t)encoderPosition + ENCODER_FEEDRATE_DEADZONE;
-          encoderPosition = 0;
-        }
-      }
-      else {
-        feedrate_percentage = new_frm;
-        encoderPosition = 0;
-      }
-    #endif // ULTIPANEL_FEEDMULTIPLY
-
-    feedrate_percentage = constrain(feedrate_percentage, 10, 999);
-
-  #endif // ULTIPANEL
-
-  #if LCD_INFO_SCREEN_STYLE == 0
-    lcd_impl_status_screen_0();
-  #elif LCD_INFO_SCREEN_STYLE == 1
-    lcd_impl_status_screen_1();
   #endif
+
+  #if ENABLED(ULTIPANEL_FEEDMULTIPLY)
+
+    const int16_t old_frm = feedrate_percentage;
+          int16_t new_frm = old_frm + int16_t(encoderPosition);
+
+    // Dead zone at 100% feedrate
+    if (old_frm == 100) {
+      if (int16_t(encoderPosition) > ENCODER_FEEDRATE_DEADZONE)
+        new_frm -= ENCODER_FEEDRATE_DEADZONE;
+      else if (int16_t(encoderPosition) < -(ENCODER_FEEDRATE_DEADZONE))
+        new_frm += ENCODER_FEEDRATE_DEADZONE;
+      else
+        new_frm = old_frm;
+    }
+    else if ((old_frm < 100 && new_frm > 100) || (old_frm > 100 && new_frm < 100))
+      new_frm = 100;
+
+    LIMIT(new_frm, 10, 999);
+
+    if (old_frm != new_frm) {
+      feedrate_percentage = new_frm;
+      encoderPosition = 0;
+      #if HAS_BUZZER && ENABLED(BEEP_ON_FEEDRATE_CHANGE)
+        static millis_t next_beep;
+        #ifndef GOT_MS
+          const millis_t ms = millis();
+        #endif
+        if (ELAPSED(ms, next_beep)) {
+          buzz(FEEDRATE_CHANGE_BEEP_DURATION, FEEDRATE_CHANGE_BEEP_FREQUENCY);
+          next_beep = ms + 500UL;
+        }
+      #endif
+    }
+
+  #endif // ULTIPANEL_FEEDMULTIPLY
+
+  draw_status_screen();
 }
 
-/**
- * Reset the status message
- */
-void lcd_reset_status() {
-  static const char paused[] PROGMEM = MSG_PRINT_PAUSED;
-  static const char printing[] PROGMEM = MSG_PRINTING;
-  static const char welcome[] PROGMEM = WELCOME_MSG;
-  PGM_P msg;
-  if (print_job_timer.isPaused())
-    msg = paused;
-  #if ENABLED(SDSUPPORT)
-    else if (card.sdprinting)
-      return lcd_setstatus(card.longest_filename(), true);
+void MarlinUI::kill_screen(PGM_P lcd_error, PGM_P lcd_component) {
+  init();
+  status_printf_P(1, PSTR(S_FMT ": " S_FMT), lcd_error, lcd_component);
+  #if HAS_LCD_MENU
+    return_to_status();
   #endif
-  else if (print_job_timer.isRunning())
-    msg = printing;
-  else
-    msg = welcome;
 
-  lcd_setstatusPGM(msg, -1);
-}
-
-void kill_screen(PGM_P lcd_msg) {
-  lcd_init();
-  lcd_setalertstatusPGM(lcd_msg);
-  lcd_kill_screen();
-}
-
-#if HAS_BUZZER
-  void lcd_buzz(const long duration, const uint16_t freq) {
-    #if ENABLED(LCD_USE_I2C_BUZZER)
-      lcd.buzz(duration, freq);
-    #elif PIN_EXISTS(BEEPER)
-      buzzer.tone(duration, freq);
+  // RED ALERT. RED ALERT.
+  #ifdef LED_BACKLIGHT_TIMEOUT
+    leds.set_color(LEDColorRed());
+    #ifdef NEOPIXEL_BKGD_LED_INDEX
+      neo.set_pixel_color(NEOPIXEL_BKGD_LED_INDEX, 255, 0, 0, 0);
+      neo.show();
     #endif
-  }
-#endif
+  #endif
 
-void lcd_quick_feedback(const bool clear_buttons) {
+  draw_kill_screen();
+}
 
-  #if ENABLED(ULTIPANEL)
-    lcd_refresh();
+void MarlinUI::quick_feedback(const bool clear_buttons/*=true*/) {
+
+  #if HAS_LCD_MENU
+    refresh();
+  #endif
+
+  #if HAS_ENCODER_ACTION
     if (clear_buttons) buttons = 0;
     next_button_update_ms = millis() + 500;
   #else
     UNUSED(clear_buttons);
   #endif
 
-  // Buzz and wait. The delay is needed for buttons to settle!
-  lcd_buzz(LCD_FEEDBACK_FREQUENCY_DURATION_MS, LCD_FEEDBACK_FREQUENCY_HZ);
-
-  #if ENABLED(ULTIPANEL)
-    #if ENABLED(LCD_USE_I2C_BUZZER)
-      delay(10);
-    #elif PIN_EXISTS(BEEPER)
-      for (int8_t i = 5; i--;) { buzzer.tick(); delay(2); }
+  #if HAS_BUZZER
+    // Buzz and wait. Is the delay needed for buttons to settle?
+    buzz(LCD_FEEDBACK_FREQUENCY_DURATION_MS, LCD_FEEDBACK_FREQUENCY_HZ);
+    #if HAS_LCD_MENU
+      #if USE_BEEPER
+        for (int8_t i = 5; i--;) { buzzer.tick(); delay(2); }
+      #else
+        delay(10);
+      #endif
     #endif
   #endif
 }
 
-#if ENABLED(ULTIPANEL)
+////////////////////////////////////////////
+/////////////// Manual Move ////////////////
+////////////////////////////////////////////
+
+#if HAS_LCD_MENU
 
   extern bool no_reentry; // Flag to prevent recursion into menu handlers
 
@@ -542,30 +643,26 @@ void lcd_quick_feedback(const bool clear_buttons) {
   millis_t manual_move_start_time = 0;
 
   #if IS_KINEMATIC
-    bool processing_manual_move = false;
+    bool MarlinUI::processing_manual_move = false;
     float manual_move_offset = 0;
   #endif
 
-  #if !IS_KINEMATIC || (IS_KINEMATIC && EXTRUDERS > 1)
-    int8_t manual_move_e_index = 0;
-  #else
-    constexpr int8_t manual_move_e_index = 0;
+  #if E_MANUAL > 1
+    int8_t MarlinUI::manual_move_e_index = 0;
   #endif
 
   /**
    * If the most recent manual move hasn't been fed to the planner yet,
    * and the planner can accept one, send a move immediately.
    */
-  void manage_manual_move() {
+  void MarlinUI::manage_manual_move() {
 
     if (processing_manual_move) return;
 
     if (manual_move_axis != (int8_t)NO_AXIS && ELAPSED(millis(), manual_move_start_time) && !planner.is_full()) {
 
+      const feedRate_t fr_mm_s = MMM_TO_MMS(manual_feedrate_mm_m[manual_move_axis]);
       #if IS_KINEMATIC
-
-        const float old_feedrate = feedrate_mm_s;
-        feedrate_mm_s = MMM_TO_MMS(manual_feedrate_mm_m[manual_move_axis]);
 
         #if EXTRUDERS > 1
           const int8_t old_extruder = active_extruder;
@@ -573,7 +670,7 @@ void lcd_quick_feedback(const bool clear_buttons) {
         #endif
 
         // Set movement on a single axis
-        set_destination_from_current();
+        destination = current_position;
         destination[manual_move_axis] += manual_move_offset;
 
         // Reset for the next move
@@ -585,24 +682,23 @@ void lcd_quick_feedback(const bool clear_buttons) {
         // previous invocation is being blocked. Modifications to manual_move_offset shouldn't be made while
         // processing_manual_move is true or the planner will get out of sync.
         processing_manual_move = true;
-        prepare_move_to_destination(); // will call set_current_from_destination()
+        prepare_internal_move_to_destination(fr_mm_s);  // will set current_position from destination
         processing_manual_move = false;
 
-        feedrate_mm_s = old_feedrate;
         #if EXTRUDERS > 1
           active_extruder = old_extruder;
         #endif
 
       #else
 
-        planner.buffer_line(current_position, MMM_TO_MMS(manual_feedrate_mm_m[manual_move_axis]), manual_move_axis == E_AXIS ? manual_move_e_index : active_extruder);
+        planner.buffer_line(current_position, fr_mm_s, manual_move_axis == E_AXIS ? manual_move_e_index : active_extruder);
         manual_move_axis = (int8_t)NO_AXIS;
 
       #endif
     }
   }
 
-#endif // ULTIPANEL
+#endif // HAS_LCD_MENU
 
 /**
  * Update the LCD, read encoder buttons, etc.
@@ -611,7 +707,7 @@ void lcd_quick_feedback(const bool clear_buttons) {
  *   - Act on RepRap World keypad input
  *   - Update the encoder position
  *   - Apply acceleration to the encoder position
- *   - Set lcdDrawUpdate = LCDVIEW_CALL_REDRAW_NOW on controller events
+ *   - Do refresh(LCDVIEW_CALL_REDRAW_NOW) on controller events
  *   - Reset the Info Screen timeout if there's any input
  *   - Update status indicators, if any
  *
@@ -621,7 +717,7 @@ void lcd_quick_feedback(const bool clear_buttons) {
  *   - Call the menu handler. Menu handlers should do the following:
  *     - If a value changes, set lcdDrawUpdate to LCDVIEW_REDRAW_NOW and draw the value
  *       (Encoder events automatically set lcdDrawUpdate for you.)
- *     - if (lcdDrawUpdate) { redraw }
+ *     - if (should_draw()) { redraw }
  *     - Before exiting the handler set lcdDrawUpdate to:
  *       - LCDVIEW_CLEAR_CALL_REDRAW to clear screen and set LCDVIEW_CALL_REDRAW_NEXT.
  *       - LCDVIEW_REDRAW_NOW to draw now (including remaining stripes).
@@ -637,141 +733,189 @@ void lcd_quick_feedback(const bool clear_buttons) {
  * This function is only called from the main thread.
  */
 
-LCDViewAction lcdDrawUpdate = LCDVIEW_CLEAR_CALL_REDRAW;
+LCDViewAction MarlinUI::lcdDrawUpdate = LCDVIEW_CLEAR_CALL_REDRAW;
 
-#if ENABLED(AUTO_BED_LEVELING_UBL) || ENABLED(G26_MESH_VALIDATION)
-  bool lcd_external_control; // = false
-#endif
-
-#if ENABLED(LCD_HAS_SLOW_BUTTONS)
-  volatile uint8_t slow_buttons;
-#endif
-
-void lcd_update() {
+void MarlinUI::update() {
 
   static uint16_t max_display_update_time = 0;
   static millis_t next_lcd_update_ms;
+  millis_t ms = millis();
 
-  #if ENABLED(ULTIPANEL)
+  #if HAS_LCD_MENU && LCD_TIMEOUT_TO_STATUS
     static millis_t return_to_status_ms = 0;
+    #define RESET_STATUS_TIMEOUT() (return_to_status_ms = ms + LCD_TIMEOUT_TO_STATUS)
+  #else
+    #define RESET_STATUS_TIMEOUT() NOOP
+  #endif
+
+  #ifdef LED_BACKLIGHT_TIMEOUT
+    leds.update_timeout(powersupply_on);
+  #endif
+
+  #if HAS_LCD_MENU
 
     // Handle any queued Move Axis motion
     manage_manual_move();
 
-    // Update button states for LCD_CLICKED, etc.
-    // After state changes the next button update
-    // may be delayed 300-500ms.
-    lcd_buttons_update();
-
-    #if ENABLED(AUTO_BED_LEVELING_UBL)
-      // Don't run the debouncer if UBL owns the display
-      #define UBL_CONDITION !lcd_external_control
-    #else
-      #define UBL_CONDITION true
-    #endif
+    // Update button states for button_pressed(), etc.
+    // If the state changes the next update may be delayed 300-500ms.
+    update_buttons();
 
     // If the action button is pressed...
-    if (UBL_CONDITION && LCD_CLICKED) {
-      if (!wait_for_unclick) {           // If not waiting for a debounce release:
-        wait_for_unclick = true;         //  Set debounce flag to ignore continous clicks
-        lcd_clicked = !wait_for_user && !no_reentry; //  Keep the click if not waiting for a user-click
-        wait_for_user = false;           //  Any click clears wait for user
-        lcd_quick_feedback(true);        //  Always make a click sound
+    static bool wait_for_unclick; // = false
+
+    #if ENABLED(TOUCH_BUTTONS)
+
+      #define TOUCH_MENU_MASK 0x80
+
+      static bool arrow_pressed; // = false
+
+      // Handle touch events which are slow to read
+      if (ELAPSED(ms, next_button_update_ms)) {
+        uint8_t touch_buttons = touch.read_buttons();
+        if (touch_buttons) {
+          RESET_STATUS_TIMEOUT();
+          if (touch_buttons & TOUCH_MENU_MASK) {        // Processing Menu Area touch?
+            if (!wait_for_unclick) {                    // If not waiting for a debounce release:
+              wait_for_unclick = true;                  //  - Set debounce flag to ignore continous clicks
+              wait_for_user = false;                    //  - Any click clears wait for user
+              // TODO for next PR.
+              //uint8_t tpos = touch_buttons & ~(TOUCH_MENU_MASK);  // Safe 7bit touched screen coordinate
+              next_button_update_ms = ms + 500;         // Defer next check for 1/2 second
+              #if HAS_LCD_MENU
+                refresh();
+              #endif
+            }
+            touch_buttons = 0;                          // Swallow the touch
+          }
+          buttons |= (touch_buttons & (EN_C | EN_D));   // Pass on Click and Back buttons
+          if (touch_buttons & (EN_A | EN_B)) {          // A and/or B button?
+            encoderDiff = (ENCODER_STEPS_PER_MENU_ITEM) * (ENCODER_PULSES_PER_STEP) * encoderDirection;
+            if (touch_buttons & EN_A) encoderDiff *= -1;
+            next_button_update_ms = ms + repeat_delay;  // Assume the repeat delay
+            if (!wait_for_unclick && !arrow_pressed) {  // On click prepare for repeat
+              next_button_update_ms += 250;             // Longer delay on first press
+              arrow_pressed = true;                     // Mark arrow as pressed
+              #if HAS_BUZZER
+                buzz(LCD_FEEDBACK_FREQUENCY_DURATION_MS, LCD_FEEDBACK_FREQUENCY_HZ);
+              #endif
+            }
+          }
+        }
+        if (!(touch_buttons & (EN_A | EN_B))) arrow_pressed = false;
+      }
+
+    #endif // TOUCH_BUTTONS
+
+    // Integrated LCD click handling via button_pressed
+    if (!external_control && button_pressed()) {
+      if (!wait_for_unclick) {                        // If not waiting for a debounce release:
+        wait_for_unclick = true;                      //  - Set debounce flag to ignore continous clicks
+        lcd_clicked = !wait_for_user && !no_reentry;  //  - Keep the click if not waiting for a user-click
+        wait_for_user = false;                        //  - Any click clears wait for user
+        quick_feedback();                             //  - Always make a click sound
       }
     }
-    else wait_for_unclick = false;
+    else
+      wait_for_unclick = false;
 
-    #if BUTTON_EXISTS(BACK)
-      if (LCD_BACK_CLICKED) {
-        lcd_quick_feedback(true);
-        lcd_goto_previous_menu();
-      }
-    #endif
+    if (LCD_BACK_CLICKED()) {
+      quick_feedback();
+      goto_previous_screen();
+    }
 
-  #endif // ULTIPANEL
+  #endif // HAS_LCD_MENU
 
-  #if ENABLED(SDSUPPORT) && PIN_EXISTS(SD_DETECT)
-
+  #if ENABLED(INIT_SDCARD_ON_BOOT)
+    //
+    // SPI SD Card detection (and first card init when the LCD is present)
+    //
     const uint8_t sd_status = (uint8_t)IS_SD_INSERTED();
-    if (sd_status != lcd_sd_status && lcd_detected()) {
+    if (sd_status != lcd_sd_status && detected()) {
 
       uint8_t old_sd_status = lcd_sd_status; // prevent re-entry to this block!
       lcd_sd_status = sd_status;
 
       if (sd_status) {
         safe_delay(500); // Some boards need a delay to get settled
-        card.initsd();
+        card.mount();
         if (old_sd_status == 2)
           card.beginautostart();  // Initial boot
         else
-          LCD_MESSAGEPGM(MSG_SD_INSERTED);
+          set_status_P(GET_TEXT(MSG_MEDIA_INSERTED));
       }
-      else {
-        card.release();
-        if (old_sd_status != 2) LCD_MESSAGEPGM(MSG_SD_REMOVED);
-      }
+      #if PIN_EXISTS(SD_DETECT)
+        else {
+          card.release();
+          if (old_sd_status != 2) {
+            set_status_P(GET_TEXT(MSG_MEDIA_REMOVED));
+            #if HAS_LCD_MENU
+              return_to_status();
+            #endif
+          }
+        }
 
-      lcd_refresh();
-      lcd_implementation_init( // to maybe revive the LCD if static electricity killed it.
-        #if ENABLED(LCD_PROGRESS_BAR)
-          currentScreen == lcd_status_screen ? CHARSET_INFO : CHARSET_MENU
+        #if DISABLED(NO_LCD_REINIT)
+          init_lcd(); // May revive the LCD if static electricity killed it
         #endif
-      );
+
+      #endif
+
+      refresh();
+
+      ms = millis();
+      next_lcd_update_ms = ms + LCD_UPDATE_INTERVAL;  // delay LCD update until after SD activity completes
+
+      #ifdef LED_BACKLIGHT_TIMEOUT
+        leds.reset_timeout(ms);
+      #endif
     }
 
-  #endif // SDSUPPORT && SD_DETECT_PIN
+  #endif // INIT_SDCARD_ON_BOOT
 
-  #if ENABLED(POWER_LOSS_RECOVERY)
-    if (job_recovery_commands_count && job_recovery_phase == JOB_RECOVERY_IDLE) {
-      lcd_goto_screen(menu_job_recovery);
-      job_recovery_phase = JOB_RECOVERY_MAYBE; // Waiting for a response
-    }
-  #endif
-
-  const millis_t ms = millis();
   if (ELAPSED(ms, next_lcd_update_ms)
-    #if ENABLED(DOGLCD)
+    #if HAS_GRAPHICAL_LCD
       || drawing_screen
     #endif
   ) {
 
     next_lcd_update_ms = ms + LCD_UPDATE_INTERVAL;
 
-    #if ENABLED(LCD_HAS_STATUS_INDICATORS)
-      lcd_implementation_update_indicators();
+    #if ENABLED(TOUCH_BUTTONS)
+      if (on_status_screen())
+        next_lcd_update_ms += (LCD_UPDATE_INTERVAL) * 2;
     #endif
 
-    #if ENABLED(ULTIPANEL)
+    #if ENABLED(LCD_HAS_STATUS_INDICATORS)
+      update_indicators();
+    #endif
 
-      #if ENABLED(LCD_HAS_SLOW_BUTTONS)
-        slow_buttons = lcd_implementation_read_slow_buttons(); // buttons which take too long to read in interrupt context
+    #if HAS_ENCODER_ACTION
+
+      #if HAS_SLOW_BUTTONS
+        slow_buttons = read_slow_buttons(); // Buttons that take too long to read in interrupt context
       #endif
 
-      #if ENABLED(ADC_KEYPAD)
-
-        if (handle_adc_keypad())
-          return_to_status_ms = ms + LCD_TIMEOUT_TO_STATUS;
-
-      #elif ENABLED(REPRAPWORLD_KEYPAD)
-
-        handle_reprapworld_keypad();
-
+      #if ENABLED(REPRAPWORLD_KEYPAD)
+        if (handle_keypad()) RESET_STATUS_TIMEOUT();
       #endif
 
-      const bool encoderPastThreshold = (ABS(encoderDiff) >= ENCODER_PULSES_PER_STEP);
+      const float abs_diff = ABS(encoderDiff);
+      const bool encoderPastThreshold = (abs_diff >= (ENCODER_PULSES_PER_STEP));
       if (encoderPastThreshold || lcd_clicked) {
         if (encoderPastThreshold) {
-          int32_t encoderMultiplier = 1;
 
-          #if ENABLED(ENCODER_RATE_MULTIPLIER)
+          #if HAS_LCD_MENU && ENABLED(ENCODER_RATE_MULTIPLIER)
+
+            int32_t encoderMultiplier = 1;
 
             if (encoderRateMultiplierEnabled) {
-              int32_t encoderMovementSteps = ABS(encoderDiff) / ENCODER_PULSES_PER_STEP;
+              const float encoderMovementSteps = abs_diff / (ENCODER_PULSES_PER_STEP);
 
               if (lastEncoderMovementMillis) {
                 // Note that the rate is always calculated between two passes through the
                 // loop and that the abs of the encoderDiff value is tracked.
-                float encoderStepRate = float(encoderMovementSteps) / float(ms - lastEncoderMovementMillis) * 1000;
+                const float encoderStepRate = encoderMovementSteps / float(ms - lastEncoderMovementMillis) * 1000;
 
                 if (encoderStepRate >= ENCODER_100X_STEPS_PER_SEC)     encoderMultiplier = 100;
                 else if (encoderStepRate >= ENCODER_10X_STEPS_PER_SEC) encoderMultiplier = 10;
@@ -783,105 +927,100 @@ void lcd_update() {
                   SERIAL_ECHOPAIR("  ENCODER_10X_STEPS_PER_SEC: ", ENCODER_10X_STEPS_PER_SEC);
                   SERIAL_ECHOPAIR("  ENCODER_100X_STEPS_PER_SEC: ", ENCODER_100X_STEPS_PER_SEC);
                   SERIAL_EOL();
-                #endif // ENCODER_RATE_MULTIPLIER_DEBUG
+                #endif
               }
 
               lastEncoderMovementMillis = ms;
             } // encoderRateMultiplierEnabled
+
+          #else
+
+            constexpr int32_t encoderMultiplier = 1;
+
           #endif // ENCODER_RATE_MULTIPLIER
 
-          encoderPosition += (encoderDiff * encoderMultiplier) / ENCODER_PULSES_PER_STEP;
+          encoderPosition += (encoderDiff * encoderMultiplier) / (ENCODER_PULSES_PER_STEP);
           encoderDiff = 0;
         }
-        return_to_status_ms = ms + LCD_TIMEOUT_TO_STATUS;
-        lcdDrawUpdate = LCDVIEW_REDRAW_NOW;
+
+        RESET_STATUS_TIMEOUT();
+
+        refresh(LCDVIEW_REDRAW_NOW);
+
+        #ifdef LED_BACKLIGHT_TIMEOUT
+          leds.reset_timeout(ms);
+        #endif
       }
 
-    #endif // ULTIPANEL
+    #endif
 
     // This runs every ~100ms when idling often enough.
     // Instead of tracking changes just redraw the Status Screen once per second.
-    if (
-      #if ENABLED(ULTIPANEL)
-        currentScreen == lcd_status_screen &&
-      #endif
-      !lcd_status_update_delay--
-    ) {
+    if (on_status_screen() && !lcd_status_update_delay--) {
       lcd_status_update_delay = 9
-        #if ENABLED(DOGLCD)
+        #if HAS_GRAPHICAL_LCD
           + 3
         #endif
       ;
       max_display_update_time--;
-      lcdDrawUpdate = LCDVIEW_REDRAW_NOW;
+      refresh(LCDVIEW_REDRAW_NOW);
     }
 
-    #if ENABLED(ULTIPANEL) && ENABLED(SCROLL_LONG_FILENAMES)
+    #if HAS_LCD_MENU && ENABLED(SCROLL_LONG_FILENAMES)
       // If scrolling of long file names is enabled and we are in the sd card menu,
       // cause a refresh to occur until all the text has scrolled into view.
-      if (currentScreen == menu_sdcard && filename_scroll_pos < filename_scroll_max && !lcd_status_update_delay--) {
-        lcd_status_update_delay = 6;
-        lcdDrawUpdate = LCDVIEW_REDRAW_NOW;
-        filename_scroll_pos++;
-        return_to_status_ms = ms + LCD_TIMEOUT_TO_STATUS;
+      if (currentScreen == menu_media && !lcd_status_update_delay--) {
+        lcd_status_update_delay = 4;
+        if (++filename_scroll_pos > filename_scroll_max) {
+          filename_scroll_pos = 0;
+          lcd_status_update_delay = 12;
+        }
+        refresh(LCDVIEW_REDRAW_NOW);
+        RESET_STATUS_TIMEOUT();
       }
     #endif
 
     // then we want to use 1/2 of the time only.
     uint16_t bbr2 = planner.block_buffer_runtime() >> 1;
 
-    #if ENABLED(DOGLCD)
-      const bool &is_drawing = drawing_screen;
-    #else
-      constexpr bool is_drawing = false;
-    #endif
-
-    if ((lcdDrawUpdate || is_drawing) && (!bbr2 || bbr2 > max_display_update_time)) {
+    if ((should_draw() || drawing_screen) && (!bbr2 || bbr2 > max_display_update_time)) {
 
       // Change state of drawing flag between screen updates
-      if (!is_drawing) switch (lcdDrawUpdate) {
+      if (!drawing_screen) switch (lcdDrawUpdate) {
         case LCDVIEW_CALL_NO_REDRAW:
-          lcdDrawUpdate = LCDVIEW_NONE;
+          refresh(LCDVIEW_NONE);
           break;
         case LCDVIEW_CLEAR_CALL_REDRAW:
         case LCDVIEW_CALL_REDRAW_NEXT:
-          lcdDrawUpdate = LCDVIEW_REDRAW_NOW;
+          refresh(LCDVIEW_REDRAW_NOW);
         case LCDVIEW_REDRAW_NOW:        // set above, or by a handler through LCDVIEW_CALL_REDRAW_NEXT
         case LCDVIEW_NONE:
           break;
       } // switch
 
-      #if ENABLED(ADC_KEYPAD)
-        buttons_reprapworld_keypad = 0;
+      #if HAS_ADC_BUTTONS
+        keypad_buttons = 0;
       #endif
 
-      #if ENABLED(ULTIPANEL)
-        #define CURRENTSCREEN() (*currentScreen)()
-      #else
-        #define CURRENTSCREEN() lcd_status_screen()
-      #endif
+      #if HAS_GRAPHICAL_LCD
 
-      #if ENABLED(DOGLCD)
         #if ENABLED(LIGHTWEIGHT_UI)
-          #if ENABLED(ULTIPANEL)
-            const bool in_status = currentScreen == lcd_status_screen;
-          #else
-            constexpr bool in_status = true;
-          #endif
-          const bool do_u8g_loop = !in_status;
+          const bool in_status = on_status_screen(),
+                     do_u8g_loop = !in_status;
           lcd_in_status(in_status);
-          if (in_status) lcd_status_screen();
+          if (in_status) status_screen();
         #else
           constexpr bool do_u8g_loop = true;
         #endif
+
         if (do_u8g_loop) {
-          if (!drawing_screen) {                        // If not already drawing pages
-            u8g.firstPage();                            // Start the first page
-            drawing_screen = first_page = true;         // Flag as drawing pages
+          if (!drawing_screen) {                // If not already drawing pages
+            u8g.firstPage();                    // Start the first page
+            drawing_screen = first_page = true; // Flag as drawing pages
           }
-          lcd_setFont(FONT_MENU);                       // Setup font for every page draw
-          u8g.setColorIndex(1);                         // And reset the color
-          CURRENTSCREEN();                              // Draw and process the current screen
+          set_font(FONT_MENU);                  // Setup font for every page draw
+          u8g.setColorIndex(1);                 // And reset the color
+          run_current_screen();                 // Draw and process the current screen
           first_page = false;
 
           // The screen handler can clear drawing_screen for an action that changes the screen.
@@ -892,11 +1031,14 @@ void lcd_update() {
             return;
           }
         }
+
       #else
-        CURRENTSCREEN();
+
+        run_current_screen();
+
       #endif
 
-      #if ENABLED(ULTIPANEL)
+      #if HAS_LCD_MENU
         lcd_clicked = false;
       #endif
 
@@ -905,22 +1047,20 @@ void lcd_update() {
       NOLESS(max_display_update_time, millis() - ms);
     }
 
-    #if ENABLED(ULTIPANEL)
-
+    #if HAS_LCD_MENU && LCD_TIMEOUT_TO_STATUS
       // Return to Status Screen after a timeout
-      if (currentScreen == lcd_status_screen || defer_return_to_status)
-        return_to_status_ms = ms + LCD_TIMEOUT_TO_STATUS;
+      if (on_status_screen() || defer_return_to_status)
+        RESET_STATUS_TIMEOUT();
       else if (ELAPSED(ms, return_to_status_ms))
-        lcd_return_to_status();
-
-    #endif // ULTIPANEL
+        return_to_status();
+    #endif
 
     // Change state of drawing flag between screen updates
-    if (!is_drawing) switch (lcdDrawUpdate) {
+    if (!drawing_screen) switch (lcdDrawUpdate) {
       case LCDVIEW_CLEAR_CALL_REDRAW:
-        lcd_implementation_clear(); break;
+        clear_lcd(); break;
       case LCDVIEW_REDRAW_NOW:
-        lcdDrawUpdate = LCDVIEW_NONE;
+        refresh(LCDVIEW_NONE);
       case LCDVIEW_NONE:
       case LCDVIEW_CALL_REDRAW_NEXT:
       case LCDVIEW_CALL_NO_REDRAW:
@@ -930,132 +1070,59 @@ void lcd_update() {
   } // ELAPSED(ms, next_lcd_update_ms)
 }
 
-void lcd_finishstatus(const bool persist=false) {
-
-  #if !(ENABLED(LCD_PROGRESS_BAR) && (PROGRESS_MSG_EXPIRE > 0))
-    UNUSED(persist);
-  #endif
-
-  #if ENABLED(LCD_PROGRESS_BAR)
-    progress_bar_ms = millis();
-    #if PROGRESS_MSG_EXPIRE > 0
-      expire_status_ms = persist ? 0 : progress_bar_ms + PROGRESS_MSG_EXPIRE;
-    #endif
-  #endif
-  lcd_refresh();
-
-  #if ENABLED(FILAMENT_LCD_DISPLAY) && ENABLED(SDSUPPORT)
-    previous_lcd_status_ms = millis();  //get status message to show up for a while
-  #endif
-
-  #if ENABLED(STATUS_MESSAGE_SCROLLING)
-    status_scroll_offset = 0;
-  #endif
-}
-
-#if ENABLED(LCD_PROGRESS_BAR) && PROGRESS_MSG_EXPIRE > 0
-  void dontExpireStatus() { expire_status_ms = 0; }
-#endif
-
-bool lcd_hasstatus() { return (lcd_status_message[0] != '\0'); }
-
-void lcd_setstatus(const char * const message, const bool persist) {
-  if (lcd_status_message_level > 0) return;
-
-  // Here we have a problem. The message is encoded in UTF8, so
-  // arbitrarily cutting it will be a problem. We MUST be sure
-  // that there is no cutting in the middle of a multibyte character!
-
-  // Get a pointer to the null terminator
-  const char* pend = message + strlen(message);
-
-  //  If length of supplied UTF8 string is greater than
-  // our buffer size, start cutting whole UTF8 chars
-  while ((pend - message) > MAX_MESSAGE_LENGTH) {
-    --pend;
-    while (!START_OF_UTF8_CHAR(*pend)) --pend;
-  };
-
-  // At this point, we have the proper cut point. Use it
-  uint8_t maxLen = pend - message;
-  strncpy(lcd_status_message, message, maxLen);
-  lcd_status_message[maxLen] = '\0';
-
-  lcd_finishstatus(persist);
-}
-
-void lcd_setstatusPGM(PGM_P const message, int8_t level) {
-  if (level < 0) level = lcd_status_message_level = 0;
-  if (level < lcd_status_message_level) return;
-  lcd_status_message_level = level;
-
-  // Here we have a problem. The message is encoded in UTF8, so
-  // arbitrarily cutting it will be a problem. We MUST be sure
-  // that there is no cutting in the middle of a multibyte character!
-
-  // Get a pointer to the null terminator
-  PGM_P pend = message + strlen_P(message);
-
-  //  If length of supplied UTF8 string is greater than
-  // our buffer size, start cutting whole UTF8 chars
-  while ((pend - message) > MAX_MESSAGE_LENGTH) {
-    --pend;
-    while (!START_OF_UTF8_CHAR(pgm_read_byte(pend))) --pend;
-  };
-
-  // At this point, we have the proper cut point. Use it
-  uint8_t maxLen = pend - message;
-  strncpy_P(lcd_status_message, message, maxLen);
-  lcd_status_message[maxLen] = '\0';
-
-  lcd_finishstatus(level > 0);
-}
-
-void lcd_status_printf_P(const uint8_t level, PGM_P const fmt, ...) {
-  if (level < lcd_status_message_level) return;
-  lcd_status_message_level = level;
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf_P(lcd_status_message, MAX_MESSAGE_LENGTH, fmt, args);
-  va_end(args);
-  lcd_finishstatus(level > 0);
-}
-
-void lcd_setalertstatusPGM(PGM_P const message) {
-  lcd_setstatusPGM(message, 1);
-  #if ENABLED(ULTIPANEL)
-    lcd_return_to_status();
-  #endif
-}
-
-void lcd_reset_alert_level() { lcd_status_message_level = 0; }
-
-#if ENABLED(ADC_KEYPAD)
+#if HAS_ADC_BUTTONS
 
   typedef struct {
     uint16_t ADCKeyValueMin, ADCKeyValueMax;
     uint8_t  ADCKeyNo;
   } _stADCKeypadTable_;
 
+  #ifndef ADC_BUTTONS_VALUE_SCALE
+    #define ADC_BUTTONS_VALUE_SCALE       1.0  // for the power voltage equal to the reference voltage
+  #endif
+  #ifndef ADC_BUTTONS_R_PULLUP
+    #define ADC_BUTTONS_R_PULLUP          4.7  // common pull-up resistor in the voltage divider
+  #endif
+  #ifndef ADC_BUTTONS_LEFT_R_PULLDOWN
+    #define ADC_BUTTONS_LEFT_R_PULLDOWN   0.47 // pull-down resistor for LEFT button voltage divider
+  #endif
+  #ifndef ADC_BUTTONS_RIGHT_R_PULLDOWN
+    #define ADC_BUTTONS_RIGHT_R_PULLDOWN  4.7  // pull-down resistor for RIGHT button voltage divider
+  #endif
+  #ifndef ADC_BUTTONS_UP_R_PULLDOWN
+    #define ADC_BUTTONS_UP_R_PULLDOWN     1.0  // pull-down resistor for UP button voltage divider
+  #endif
+  #ifndef ADC_BUTTONS_DOWN_R_PULLDOWN
+    #define ADC_BUTTONS_DOWN_R_PULLDOWN   10.0 // pull-down resistor for DOWN button voltage divider
+  #endif
+  #ifndef ADC_BUTTONS_MIDDLE_R_PULLDOWN
+    #define ADC_BUTTONS_MIDDLE_R_PULLDOWN 2.2  // pull-down resistor for MIDDLE button voltage divider
+  #endif
+
+  // Calculate the ADC value for the voltage divider with specified pull-down resistor value
+  #define ADC_BUTTON_VALUE(r)  (int(4096.0 * (ADC_BUTTONS_VALUE_SCALE) * r / (r + ADC_BUTTONS_R_PULLUP)))
+
   static const _stADCKeypadTable_ stADCKeyTable[] PROGMEM = {
     // VALUE_MIN, VALUE_MAX, KEY
-    { 4000, 4096, BLEN_REPRAPWORLD_KEYPAD_F1 + 1 },     // F1
-    { 4000, 4096, BLEN_REPRAPWORLD_KEYPAD_F2 + 1 },     // F2
-    { 4000, 4096, BLEN_REPRAPWORLD_KEYPAD_F3 + 1 },     // F3
-    {  300,  500, BLEN_REPRAPWORLD_KEYPAD_LEFT + 1 },   // LEFT
-    { 1900, 2200, BLEN_REPRAPWORLD_KEYPAD_RIGHT + 1 },  // RIGHT
-    {  570,  870, BLEN_REPRAPWORLD_KEYPAD_UP + 1 },     // UP
-    { 2670, 2870, BLEN_REPRAPWORLD_KEYPAD_DOWN + 1 },   // DOWN
-    { 1150, 1450, BLEN_REPRAPWORLD_KEYPAD_MIDDLE + 1 }, // ENTER
+    { 4000, 4096, 1 + BLEN_KEYPAD_F1     }, // F1
+    { 4000, 4096, 1 + BLEN_KEYPAD_F2     }, // F2
+    { 4000, 4096, 1 + BLEN_KEYPAD_F3     }, // F3
+    {  ADC_BUTTON_VALUE(ADC_BUTTONS_LEFT_R_PULLDOWN)   - 100,
+       ADC_BUTTON_VALUE(ADC_BUTTONS_LEFT_R_PULLDOWN)   + 100, 1 + BLEN_KEYPAD_LEFT   }, // LEFT  ( 272 ...  472)
+    {  ADC_BUTTON_VALUE(ADC_BUTTONS_RIGHT_R_PULLDOWN)  - 100,
+       ADC_BUTTON_VALUE(ADC_BUTTONS_RIGHT_R_PULLDOWN)  + 100, 1 + BLEN_KEYPAD_RIGHT  }, // RIGHT (1948 ... 2148)
+    {  ADC_BUTTON_VALUE(ADC_BUTTONS_UP_R_PULLDOWN)     - 100,
+       ADC_BUTTON_VALUE(ADC_BUTTONS_UP_R_PULLDOWN)     + 100, 1 + BLEN_KEYPAD_UP     }, // UP    ( 618 ...  818)
+    {  ADC_BUTTON_VALUE(ADC_BUTTONS_DOWN_R_PULLDOWN)   - 100,
+       ADC_BUTTON_VALUE(ADC_BUTTONS_DOWN_R_PULLDOWN)   + 100, 1 + BLEN_KEYPAD_DOWN   }, // DOWN  (2686 ... 2886)
+    {  ADC_BUTTON_VALUE(ADC_BUTTONS_MIDDLE_R_PULLDOWN) - 100,
+       ADC_BUTTON_VALUE(ADC_BUTTONS_MIDDLE_R_PULLDOWN) + 100, 1 + BLEN_KEYPAD_MIDDLE }, // ENTER (1205 ... 1405)
   };
 
-  uint8_t get_ADC_keyValue(void) {
+  uint8_t get_ADC_keyValue() {
     if (thermalManager.ADCKey_count >= 16) {
-      const uint16_t currentkpADCValue = thermalManager.current_ADCKey_raw >> 2;
-      #if ENABLED(ADC_KEYPAD_DEBUG)
-        SERIAL_PROTOCOLLN(currentkpADCValue);
-      #endif
-      thermalManager.current_ADCKey_raw = 0;
+      const uint16_t currentkpADCValue = thermalManager.current_ADCKey_raw << 2;
+      thermalManager.current_ADCKey_raw = 1024;
       thermalManager.ADCKey_count = 0;
       if (currentkpADCValue < 4000)
         for (uint8_t i = 0; i < ADC_KEY_NUM; i++) {
@@ -1066,192 +1133,425 @@ void lcd_reset_alert_level() { lcd_status_message_level = 0; }
     }
     return 0;
   }
-#endif
 
-#if ENABLED(ULTIPANEL)
+#endif // HAS_ADC_BUTTONS
 
-  /**
-   * Setup Rotary Encoder Bit Values (for two pin encoders to indicate movement)
-   * These values are independent of which pins are used for EN_A and EN_B indications
-   * The rotary encoder part is also independent to the chipset used for the LCD
-   */
-  #if defined(EN_A) && defined(EN_B)
-    #define encrot0 0
-    #define encrot1 2
-    #define encrot2 3
-    #define encrot3 1
-  #endif
+#if HAS_ENCODER_ACTION
 
-  #define GET_SHIFT_BUTTON_STATES(DST) \
-    uint8_t new_##DST = 0; \
-    WRITE(SHIFT_LD, LOW); \
-    WRITE(SHIFT_LD, HIGH); \
-    for (int8_t i = 0; i < 8; i++) { \
-      new_##DST >>= 1; \
-      if (READ(SHIFT_OUT)) SBI(new_##DST, 7); \
-      WRITE(SHIFT_CLK, HIGH); \
-      WRITE(SHIFT_CLK, LOW); \
-    } \
-    DST = ~new_##DST; //invert it, because a pressed switch produces a logical 0
+  #if DISABLED(ADC_KEYPAD) && (ENABLED(REPRAPWORLD_KEYPAD) || !HAS_DIGITAL_BUTTONS)
 
-  #if (ENABLED(LCD_I2C_TYPE_MCP23017) || ENABLED(LCD_I2C_TYPE_MCP23008)) && ENABLED(DETECT_DEVICE)
-    bool lcd_detected() { return lcd.LcdDetected() == 1; }
-  #else
-    bool lcd_detected() { return true; }
-  #endif
+    /**
+     * Setup Rotary Encoder Bit Values (for two pin encoders to indicate movement)
+     * These values are independent of which pins are used for EN_A and EN_B indications
+     * The rotary encoder part is also independent to the chipset used for the LCD
+     */
+    #define GET_SHIFT_BUTTON_STATES(DST) \
+      uint8_t new_##DST = 0; \
+      WRITE(SHIFT_LD, LOW); \
+      WRITE(SHIFT_LD, HIGH); \
+      for (int8_t i = 0; i < 8; i++) { \
+        new_##DST >>= 1; \
+        if (READ(SHIFT_OUT)) SBI(new_##DST, 7); \
+        WRITE(SHIFT_CLK, HIGH); \
+        WRITE(SHIFT_CLK, LOW); \
+      } \
+      DST = ~new_##DST; //invert it, because a pressed switch produces a logical 0
 
-  #if ENABLED(G26_MESH_VALIDATION)
-    void lcd_chirp() {
-      lcd_buzz(LCD_FEEDBACK_FREQUENCY_DURATION_MS, LCD_FEEDBACK_FREQUENCY_HZ);
-    }
-  #endif
-
-  #if ENABLED(AUTO_BED_LEVELING_UBL) || ENABLED(G26_MESH_VALIDATION)
-    bool is_lcd_clicked() { return LCD_CLICKED; }
-    void wait_for_release() {
-      while (is_lcd_clicked()) safe_delay(50);
-      safe_delay(50);
-    }
   #endif
 
   /**
    * Read encoder buttons from the hardware registers
    * Warning: This function is called from interrupt context!
    */
-  void lcd_buttons_update() {
-    static uint8_t lastEncoderBits;
+  void MarlinUI::update_buttons() {
     const millis_t now = millis();
     if (ELAPSED(now, next_button_update_ms)) {
 
-      #if ENABLED(NEWPANEL)
-        uint8_t newbutton = 0;
+      #if HAS_DIGITAL_BUTTONS
 
-        #if BUTTON_EXISTS(EN1)
-          if (BUTTON_PRESSED(EN1)) newbutton |= EN_A;
-        #endif
-        #if BUTTON_EXISTS(EN2)
-          if (BUTTON_PRESSED(EN2)) newbutton |= EN_B;
-        #endif
-        #if BUTTON_EXISTS(ENC)
-          if (BUTTON_PRESSED(ENC)) newbutton |= EN_C;
-        #endif
-        #if BUTTON_EXISTS(BACK)
-          if (BUTTON_PRESSED(BACK)) newbutton |= EN_D;
+        #if ANY_BUTTON(EN1, EN2, ENC, BACK)
+
+          uint8_t newbutton = 0;
+
+          #if BUTTON_EXISTS(EN1)
+            if (BUTTON_PRESSED(EN1)) newbutton |= EN_A;
+          #endif
+          #if BUTTON_EXISTS(EN2)
+            if (BUTTON_PRESSED(EN2)) newbutton |= EN_B;
+          #endif
+          #if BUTTON_EXISTS(ENC)
+            if (BUTTON_PRESSED(ENC)) newbutton |= EN_C;
+          #endif
+          #if BUTTON_EXISTS(BACK)
+            if (BUTTON_PRESSED(BACK)) newbutton |= EN_D;
+          #endif
+
+        #else
+
+          constexpr uint8_t newbutton = 0;
+
         #endif
 
         //
         // Directional buttons
         //
-        #if LCD_HAS_DIRECTIONAL_BUTTONS
+        #if ANY_BUTTON(UP, DWN, LFT, RT)
 
-          #if ENABLED(REVERSE_MENU_DIRECTION)
-            #define _ENCODER_UD_STEPS (ENCODER_STEPS_PER_MENU_ITEM * encoderDirection)
-          #else
-            #define _ENCODER_UD_STEPS ENCODER_STEPS_PER_MENU_ITEM
-          #endif
-          #if ENABLED(REVERSE_ENCODER_DIRECTION)
-            #define ENCODER_UD_STEPS _ENCODER_UD_STEPS
-            #define ENCODER_LR_PULSES ENCODER_PULSES_PER_STEP
-          #else
-            #define ENCODER_UD_STEPS -(_ENCODER_UD_STEPS)
-            #define ENCODER_LR_PULSES -(ENCODER_PULSES_PER_STEP)
-          #endif
+          const int8_t pulses = (ENCODER_PULSES_PER_STEP) * encoderDirection;
 
           if (false) {
             // for the else-ifs below
           }
           #if BUTTON_EXISTS(UP)
             else if (BUTTON_PRESSED(UP)) {
-              encoderDiff = -(ENCODER_UD_STEPS);
+              encoderDiff = (ENCODER_STEPS_PER_MENU_ITEM) * pulses;
               next_button_update_ms = now + 300;
             }
           #endif
           #if BUTTON_EXISTS(DWN)
             else if (BUTTON_PRESSED(DWN)) {
-              encoderDiff = ENCODER_UD_STEPS;
+              encoderDiff = -(ENCODER_STEPS_PER_MENU_ITEM) * pulses;
               next_button_update_ms = now + 300;
             }
           #endif
           #if BUTTON_EXISTS(LFT)
             else if (BUTTON_PRESSED(LFT)) {
-              encoderDiff = -(ENCODER_LR_PULSES);
+              encoderDiff = -pulses;
               next_button_update_ms = now + 300;
             }
           #endif
           #if BUTTON_EXISTS(RT)
             else if (BUTTON_PRESSED(RT)) {
-              encoderDiff = ENCODER_LR_PULSES;
+              encoderDiff = pulses;
               next_button_update_ms = now + 300;
             }
           #endif
 
-        #endif // LCD_HAS_DIRECTIONAL_BUTTONS
+        #endif // UP || DWN || LFT || RT
 
-        buttons = newbutton;
-        #if ENABLED(LCD_HAS_SLOW_BUTTONS)
-          buttons |= slow_buttons;
-        #endif
+        buttons = newbutton
+          #if HAS_SLOW_BUTTONS
+            | slow_buttons
+          #endif
+        ;
 
-        #if ENABLED(ADC_KEYPAD)
+      #elif HAS_ADC_BUTTONS
 
-          uint8_t newbutton_reprapworld_keypad = 0;
-          buttons = 0;
-          if (buttons_reprapworld_keypad == 0) {
-            newbutton_reprapworld_keypad = get_ADC_keyValue();
-            if (WITHIN(newbutton_reprapworld_keypad, 1, 8))
-              buttons_reprapworld_keypad = _BV(newbutton_reprapworld_keypad - 1);
-          }
+        buttons = 0;
 
-        #elif ENABLED(REPRAPWORLD_KEYPAD)
+      #endif
 
-          GET_SHIFT_BUTTON_STATES(buttons_reprapworld_keypad);
+      #if HAS_ADC_BUTTONS
+        if (keypad_buttons == 0) {
+          const uint8_t b = get_ADC_keyValue();
+          if (WITHIN(b, 1, 8)) keypad_buttons = _BV(b - 1);
+        }
+      #endif
 
-        #endif
+      #if HAS_SHIFT_ENCODER
 
-      #else // !NEWPANEL
-
-        GET_SHIFT_BUTTON_STATES(buttons);
+        GET_SHIFT_BUTTON_STATES(
+          #if ENABLED(REPRAPWORLD_KEYPAD)
+            keypad_buttons
+          #else
+            buttons
+          #endif
+        );
 
       #endif
 
     } // next_button_update_ms
 
-    // Manage encoder rotation
-    #if ENABLED(REVERSE_MENU_DIRECTION) && ENABLED(REVERSE_ENCODER_DIRECTION)
-      #define ENCODER_DIFF_CW  (encoderDiff -= encoderDirection)
-      #define ENCODER_DIFF_CCW (encoderDiff += encoderDirection)
-    #elif ENABLED(REVERSE_MENU_DIRECTION)
-      #define ENCODER_DIFF_CW  (encoderDiff += encoderDirection)
-      #define ENCODER_DIFF_CCW (encoderDiff -= encoderDirection)
-    #elif ENABLED(REVERSE_ENCODER_DIRECTION)
-      #define ENCODER_DIFF_CW  (encoderDiff--)
-      #define ENCODER_DIFF_CCW (encoderDiff++)
-    #else
-      #define ENCODER_DIFF_CW  (encoderDiff++)
-      #define ENCODER_DIFF_CCW (encoderDiff--)
-    #endif
-    #define ENCODER_SPIN(_E1, _E2) switch (lastEncoderBits) { case _E1: ENCODER_DIFF_CW; break; case _E2: ENCODER_DIFF_CCW; }
+    #if HAS_ENCODER_WHEEL
+      static uint8_t lastEncoderBits;
 
-    uint8_t enc = 0;
-    if (buttons & EN_A) enc |= B01;
-    if (buttons & EN_B) enc |= B10;
-    if (enc != lastEncoderBits) {
-      switch (enc) {
-        case encrot0: ENCODER_SPIN(encrot3, encrot1); break;
-        case encrot1: ENCODER_SPIN(encrot0, encrot2); break;
-        case encrot2: ENCODER_SPIN(encrot1, encrot3); break;
-        case encrot3: ENCODER_SPIN(encrot2, encrot0); break;
-      }
-      #if ENABLED(AUTO_BED_LEVELING_UBL)
-        if (lcd_external_control) {
-          ubl.encoder_diff = encoderDiff;   // Make encoder rotation available to UBL G29 mesh editing.
-          encoderDiff = 0;                  // Hide the encoder event from the current screen handler.
+      #define encrot0 0
+      #define encrot1 2
+      #define encrot2 3
+      #define encrot3 1
+
+      // Manage encoder rotation
+      #define ENCODER_SPIN(_E1, _E2) switch (lastEncoderBits) { case _E1: encoderDiff += encoderDirection; break; case _E2: encoderDiff -= encoderDirection; }
+
+      uint8_t enc = 0;
+      if (buttons & EN_A) enc |= B01;
+      if (buttons & EN_B) enc |= B10;
+      if (enc != lastEncoderBits) {
+        switch (enc) {
+          case encrot0: ENCODER_SPIN(encrot3, encrot1); break;
+          case encrot1: ENCODER_SPIN(encrot0, encrot2); break;
+          case encrot2: ENCODER_SPIN(encrot1, encrot3); break;
+          case encrot3: ENCODER_SPIN(encrot2, encrot0); break;
         }
-      #endif
-      lastEncoderBits = enc;
-    }
+        if (external_control) {
+          #if ENABLED(AUTO_BED_LEVELING_UBL)
+            ubl.encoder_diff = encoderDiff;   // Make encoder rotation available to UBL G29 mesh editing.
+          #endif
+          encoderDiff = 0;                    // Hide the encoder event from the current screen handler.
+        }
+        lastEncoderBits = enc;
+      }
+
+    #endif // HAS_ENCODER_WHEEL
   }
 
-#endif // ULTIPANEL
+#endif // HAS_ENCODER_ACTION
 
-#endif // ULTRA_LCD
+#endif // HAS_SPI_LCD
+
+#if HAS_DISPLAY
+
+  #if ENABLED(EXTENSIBLE_UI)
+    #include "extensible_ui/ui_api.h"
+  #endif
+
+  ////////////////////////////////////////////
+  /////////////// Status Line ////////////////
+  ////////////////////////////////////////////
+
+  #if ENABLED(STATUS_MESSAGE_SCROLLING)
+    void MarlinUI::advance_status_scroll() {
+      // Advance by one UTF8 code-word
+      if (status_scroll_offset < utf8_strlen(status_message))
+        while (!START_OF_UTF8_CHAR(status_message[++status_scroll_offset]));
+      else
+        status_scroll_offset = 0;
+    }
+    char* MarlinUI::status_and_len(uint8_t &len) {
+      char *out = status_message + status_scroll_offset;
+      len = utf8_strlen(out);
+      return out;
+    }
+  #endif
+
+  void MarlinUI::finish_status(const bool persist) {
+
+    #if !(ENABLED(LCD_PROGRESS_BAR) && (PROGRESS_MSG_EXPIRE > 0))
+      UNUSED(persist);
+    #endif
+
+    #if ENABLED(LCD_PROGRESS_BAR)
+      progress_bar_ms = millis();
+      #if PROGRESS_MSG_EXPIRE > 0
+        expire_status_ms = persist ? 0 : progress_bar_ms + PROGRESS_MSG_EXPIRE;
+      #endif
+    #endif
+
+    #if BOTH(FILAMENT_LCD_DISPLAY, SDSUPPORT)
+      next_filament_display = millis() + 5000UL; // Show status message for 5s
+    #endif
+
+    #if HAS_SPI_LCD && ENABLED(STATUS_MESSAGE_SCROLLING)
+      status_scroll_offset = 0;
+    #endif
+
+    #if ENABLED(EXTENSIBLE_UI)
+      ExtUI::onStatusChanged(status_message);
+    #endif
+  }
+
+  bool MarlinUI::has_status() { return (status_message[0] != '\0'); }
+
+  void MarlinUI::set_status(const char * const message, const bool persist) {
+    if (alert_level) return;
+
+    // Here we have a problem. The message is encoded in UTF8, so
+    // arbitrarily cutting it will be a problem. We MUST be sure
+    // that there is no cutting in the middle of a multibyte character!
+
+    // Get a pointer to the null terminator
+    const char* pend = message + strlen(message);
+
+    //  If length of supplied UTF8 string is greater than
+    // our buffer size, start cutting whole UTF8 chars
+    while ((pend - message) > MAX_MESSAGE_LENGTH) {
+      --pend;
+      while (!START_OF_UTF8_CHAR(*pend)) --pend;
+    };
+
+    // At this point, we have the proper cut point. Use it
+    uint8_t maxLen = pend - message;
+    strncpy(status_message, message, maxLen);
+    status_message[maxLen] = '\0';
+
+    finish_status(persist);
+  }
+
+  #include <stdarg.h>
+
+  void MarlinUI::status_printf_P(const uint8_t level, PGM_P const fmt, ...) {
+    if (level < alert_level) return;
+    alert_level = level;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf_P(status_message, MAX_MESSAGE_LENGTH, fmt, args);
+    va_end(args);
+    finish_status(level > 0);
+  }
+
+  void MarlinUI::set_status_P(PGM_P const message, int8_t level) {
+    if (level < 0) level = alert_level = 0;
+    if (level < alert_level) return;
+    alert_level = level;
+
+    // Since the message is encoded in UTF8 it must
+    // only be cut on a character boundary.
+
+    // Get a pointer to the null terminator
+    PGM_P pend = message + strlen_P(message);
+
+    // If length of supplied UTF8 string is greater than
+    // the buffer size, start cutting whole UTF8 chars
+    while ((pend - message) > MAX_MESSAGE_LENGTH) {
+      --pend;
+      while (!START_OF_UTF8_CHAR(pgm_read_byte(pend))) --pend;
+    };
+
+    // At this point, we have the proper cut point. Use it
+    uint8_t maxLen = pend - message;
+    strncpy_P(status_message, message, maxLen);
+    status_message[maxLen] = '\0';
+
+    finish_status(level > 0);
+  }
+
+  void MarlinUI::set_alert_status_P(PGM_P const message) {
+    set_status_P(message, 1);
+    #if HAS_LCD_MENU
+      return_to_status();
+    #endif
+  }
+
+  #include "../Marlin.h"
+  #include "../module/printcounter.h"
+
+  PGM_P print_paused = GET_TEXT(MSG_PRINT_PAUSED);
+
+  /**
+   * Reset the status message
+   */
+  void MarlinUI::reset_status() {
+    PGM_P printing = GET_TEXT(MSG_PRINTING);
+    PGM_P welcome  = GET_TEXT(WELCOME_MSG);
+    #if SERVICE_INTERVAL_1 > 0
+      static const char service1[] PROGMEM = { "> " SERVICE_NAME_1 "!" };
+    #endif
+    #if SERVICE_INTERVAL_2 > 0
+      static const char service2[] PROGMEM = { "> " SERVICE_NAME_2 "!" };
+    #endif
+    #if SERVICE_INTERVAL_3 > 0
+      static const char service3[] PROGMEM = { "> " SERVICE_NAME_3 "!" };
+    #endif
+    PGM_P msg;
+    if (printingIsPaused())
+      msg = print_paused;
+    #if ENABLED(SDSUPPORT)
+      else if (IS_SD_PRINTING())
+        return set_status(card.longest_filename(), true);
+    #endif
+    else if (print_job_timer.isRunning())
+      msg = printing;
+
+    #if SERVICE_INTERVAL_1 > 0
+      else if (print_job_timer.needsService(1)) msg = service1;
+    #endif
+    #if SERVICE_INTERVAL_2 > 0
+      else if (print_job_timer.needsService(2)) msg = service2;
+    #endif
+    #if SERVICE_INTERVAL_3 > 0
+      else if (print_job_timer.needsService(3)) msg = service3;
+    #endif
+
+    else
+      msg = welcome;
+
+    set_status_P(msg, -1);
+  }
+
+  #if ENABLED(SDSUPPORT)
+    extern bool wait_for_user, wait_for_heatup;
+  #endif
+
+  void MarlinUI::abort_print() {
+    #if ENABLED(SDSUPPORT)
+      wait_for_heatup = wait_for_user = false;
+      card.flag.abort_sd_printing = true;
+    #endif
+    #ifdef ACTION_ON_CANCEL
+      host_action_cancel();
+    #endif
+    #if ENABLED(HOST_PROMPT_SUPPORT)
+      host_prompt_open(PROMPT_INFO, PSTR("UI Aborted"), PSTR("Dismiss"));
+    #endif
+    print_job_timer.stop();
+    set_status_P(GET_TEXT(MSG_PRINT_ABORTED));
+    #if HAS_LCD_MENU
+      return_to_status();
+    #endif
+  }
+
+  #if ANY(PARK_HEAD_ON_PAUSE, SDSUPPORT)
+    #include "../gcode/queue.h"
+  #endif
+
+  void MarlinUI::pause_print() {
+    #if HAS_LCD_MENU
+      synchronize(GET_TEXT(MSG_PAUSE_PRINT));
+    #endif
+
+    #if ENABLED(POWER_LOSS_RECOVERY)
+      if (recovery.enabled) recovery.save(true, false);
+    #endif
+
+    #if ENABLED(HOST_PROMPT_SUPPORT)
+      host_prompt_open(PROMPT_PAUSE_RESUME, PSTR("UI Pause"), PSTR("Resume"));
+    #endif
+
+    set_status_P(print_paused);
+
+    #if ENABLED(PARK_HEAD_ON_PAUSE)
+      #if HAS_SPI_LCD
+        lcd_pause_show_message(PAUSE_MESSAGE_PAUSING, PAUSE_MODE_PAUSE_PRINT);  // Show message immediately to let user know about pause in progress
+      #endif
+      queue.inject_P(PSTR("M25 P\nM24"));
+    #elif ENABLED(SDSUPPORT)
+      queue.inject_P(PSTR("M25"));
+    #elif defined(ACTION_ON_PAUSE)
+      host_action_pause();
+    #endif
+  }
+
+  void MarlinUI::resume_print() {
+    reset_status();
+    #if ENABLED(PARK_HEAD_ON_PAUSE)
+      wait_for_heatup = wait_for_user = false;
+    #endif
+    if (IS_SD_PAUSED()) queue.inject_P(PSTR("M24"));
+    #ifdef ACTION_ON_RESUME
+      host_action_resume();
+    #endif
+    print_job_timer.start(); // Also called by M24
+  }
+
+  #if HAS_PRINT_PROGRESS
+
+    MarlinUI::progress_t MarlinUI::_get_progress() {
+      #if ENABLED(LCD_SET_PROGRESS_MANUALLY)
+        const progress_t p = progress_override & PROGRESS_MASK;
+      #else
+        constexpr progress_t p = 0;
+      #endif
+      return (p
+        #if ENABLED(SDSUPPORT)
+          #if HAS_PRINT_PROGRESS_PERMYRIAD
+            ?: card.permyriadDone()
+          #else
+            ?: card.percentDone()
+          #endif
+        #endif
+      );
+    }
+
+  #endif
+
+#endif // HAS_DISPLAY
